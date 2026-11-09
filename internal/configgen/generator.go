@@ -3,7 +3,8 @@ package configgen
 import (
 	"bytes"
 	"fmt"
-	"text/template"
+
+	"gopkg.in/yaml.v3"
 )
 
 // LighthouseInfo describes a lighthouse node for config generation.
@@ -17,6 +18,12 @@ type FirewallRule struct {
 	Port  string // "any", "22", "443"
 	Proto string // "any", "tcp", "udp", "icmp"
 	Group string // "any", "admin", etc.
+}
+
+// AdvancedUnsafeRoute mirrors models.UnsafeRoute for the generator input.
+type AdvancedUnsafeRoute struct {
+	Route string
+	Via   string
 }
 
 // GeneratorInput contains all parameters needed to generate a Nebula config.
@@ -33,101 +40,97 @@ type GeneratorInput struct {
 	Relays           []string
 	FirewallInbound  []FirewallRule
 	FirewallOutbound []FirewallRule
+
+	// Optional per-host overrides. Zero values mean "use the default".
+	PunchyOverride   *bool
+	ListenHost       string
+	MTU              int
+	TunDevice        string
+	UnsafeRoutes     []AdvancedUnsafeRoute
 }
-
-const configTemplate = `pki:
-  ca: {{ .CACertPath }}
-  cert: {{ .CertPath }}
-  key: {{ .KeyPath }}
-
-{{- if .IsLighthouse }}
-
-static_host_map: {}
-
-lighthouse:
-  am_lighthouse: true
-  {{- if gt .ListenPort 0 }}
-  # Lighthouse listens on port {{ .ListenPort }}
-  {{- end }}
-
-listen:
-  host: 0.0.0.0
-  port: {{ if gt .ListenPort 0 }}{{ .ListenPort }}{{ else }}4242{{ end }}
-
-{{- else }}
-
-static_host_map:
-  {{- range .Lighthouses }}
-  "{{ .NebulaIP }}": ["{{ .PublicAddr }}"]
-  {{- end }}
-
-lighthouse:
-  am_lighthouse: false
-  hosts:
-    {{- range .Lighthouses }}
-    - "{{ .NebulaIP }}"
-    {{- end }}
-
-listen:
-  host: 0.0.0.0
-  port: {{ if gt .ListenPort 0 }}{{ .ListenPort }}{{ else }}0{{ end }}
-
-{{- end }}
-
-punchy:
-  punch: true
-
-{{- if .IsRelay }}
-
-relay:
-  am_relay: true
-{{- else if .Relays }}
-
-relay:
-  relays:
-    {{- range .Relays }}
-    - "{{ . }}"
-    {{- end }}
-{{- end }}
-
-logging:
-  level: info
-  format: text
-
-firewall:
-  outbound:
-    {{- range .FirewallOutbound }}
-    - port: {{ .Port }}
-      proto: {{ .Proto }}
-      {{- if ne .Group "any" }}
-      group: {{ .Group }}
-      {{- else }}
-      host: any
-      {{- end }}
-    {{- end }}
-
-  inbound:
-    {{- range .FirewallInbound }}
-    - port: {{ .Port }}
-      proto: {{ .Proto }}
-      {{- if ne .Group "any" }}
-      group: {{ .Group }}
-      {{- else }}
-      host: any
-      {{- end }}
-    {{- end }}
-`
 
 // Generate produces a Nebula config.yml from the given input.
 func Generate(input GeneratorInput) ([]byte, error) {
-	tmpl, err := template.New("nebula-config").Parse(configTemplate)
-	if err != nil {
-		return nil, fmt.Errorf("parse template: %w", err)
+	listenHost := input.ListenHost
+	if listenHost == "" {
+		listenHost = "0.0.0.0"
+	}
+	listenPort := input.ListenPort
+	if listenPort <= 0 {
+		listenPort = 0
+		if input.IsLighthouse {
+			listenPort = 4242
+		}
+	}
+	punch := true
+	if input.PunchyOverride != nil {
+		punch = *input.PunchyOverride
+	}
+
+	staticHostMap := make(map[string][]string)
+	lighthouse := map[string]any{"am_lighthouse": input.IsLighthouse}
+	if !input.IsLighthouse {
+		hosts := make([]string, 0, len(input.Lighthouses))
+		for _, lh := range input.Lighthouses {
+			staticHostMap[lh.NebulaIP] = []string{lh.PublicAddr}
+			hosts = append(hosts, lh.NebulaIP)
+		}
+		lighthouse["hosts"] = hosts
+	}
+
+	firewallRules := func(rules []FirewallRule) []map[string]string {
+		result := make([]map[string]string, 0, len(rules))
+		for _, rule := range rules {
+			r := map[string]string{"port": rule.Port, "proto": rule.Proto}
+			if rule.Group == "any" {
+				r["host"] = "any"
+			} else {
+				r["group"] = rule.Group
+			}
+			result = append(result, r)
+		}
+		return result
+	}
+	config := map[string]any{
+		"pki": map[string]string{
+			"ca":   input.CACertPath,
+			"cert": input.CertPath,
+			"key":  input.KeyPath,
+		},
+		"static_host_map": staticHostMap,
+		"lighthouse":      lighthouse,
+		"listen":         map[string]any{"host": listenHost, "port": listenPort},
+		"punchy":         map[string]bool{"punch": punch},
+		"logging":        map[string]string{"level": "info", "format": "text"},
+		"firewall": map[string]any{
+			"outbound": firewallRules(input.FirewallOutbound),
+			"inbound":  firewallRules(input.FirewallInbound),
+		},
+	}
+	if input.MTU != 0 || input.TunDevice != "" || len(input.UnsafeRoutes) > 0 {
+		tun := make(map[string]any)
+		if input.TunDevice != "" {
+			tun["dev"] = input.TunDevice
+		}
+		if input.MTU != 0 {
+			tun["mtu"] = input.MTU
+		}
+		if len(input.UnsafeRoutes) > 0 {
+			tun["unsafe_routes"] = input.UnsafeRoutes
+		}
+		config["tun"] = tun
+	}
+	if input.IsRelay {
+		config["relay"] = map[string]bool{"am_relay": true}
+	} else if len(input.Relays) > 0 {
+		config["relay"] = map[string][]string{"relays": input.Relays}
 	}
 
 	var buf bytes.Buffer
-	if err := tmpl.Execute(&buf, input); err != nil {
-		return nil, fmt.Errorf("execute template: %w", err)
+	encoder := yaml.NewEncoder(&buf)
+	encoder.SetIndent(2)
+	if err := encoder.Encode(config); err != nil {
+		return nil, fmt.Errorf("encode config: %w", err)
 	}
 
 	return buf.Bytes(), nil
